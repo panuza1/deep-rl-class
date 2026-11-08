@@ -1,4 +1,7 @@
-stable-baselines3==2.0.0a5
+gymnasium[box2d]==0.29.1
+stable-baselines3==2.3.2
+numpy<2
 swig
-gymnasium[box2d]
 huggingface_sb3
+moviepy==1.0.3
+pyvirtualdisplay
