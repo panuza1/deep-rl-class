@@ -1,0 +1,5 @@
+sample-factory==2.1.1
+faster-fifo==1.4.2
+vizdoom
+huggingface_hub
+ipykernel

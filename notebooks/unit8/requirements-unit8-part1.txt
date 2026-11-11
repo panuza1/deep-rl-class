@@ -1,0 +1,12 @@
+setuptools==65.5.0
+gym==0.22.0
+numpy<2
+torch
+tensorboard
+pygame
+huggingface_hub
+imageio
+imageio-ffmpeg
+wasabi
+pyvirtualdisplay
+ipykernel

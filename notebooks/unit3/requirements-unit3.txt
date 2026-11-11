@@ -1,0 +1,6 @@
+rl_zoo3==2.3.0
+gymnasium[atari,accept-rom-license]==0.29.1
+huggingface_sb3
+imageio-ffmpeg
+pyvirtualdisplay
+ipykernel
