@@ -6,7 +6,7 @@ The official [certificate instructions](https://huggingface.co/learn/deep-rl-cou
 
 | Assignment | Checker environment tag | Library tag | Minimum score | Hub verification |
 | --- | --- | --- | ---: | --- |
-| Unit 1 | `LunarLander-v2` | `stable-baselines3` | 200 | Pending |
+| Unit 1 | `LunarLander-v2` | `stable-baselines3` | 200 | **Passed** (241.19; verified 2026-11-11) |
 | Unit 2 | `Taxi-v3` | `q-learning` | 4 | Pending |
 | Unit 3 | `SpaceInvadersNoFrameskip-v4` | `stable-baselines3` | 200 | Pending |
 | Unit 4 / CartPole | `CartPole-v1` | `reinforce` | 350 | Pending |
@@ -19,6 +19,7 @@ The official [certificate instructions](https://huggingface.co/learn/deep-rl-cou
 | Unit 8 / Part II | `doom_health_gathering_supreme` | `sample-factory` | 5 | Pending |
 
 **Notes**
+- On 2026-11-11, the public progress checker reported Unit 1 passed with a best score of **241.19**, model [`panuza007/ppo-LunarLander-v2`](https://huggingface.co/panuza007/ppo-LunarLander-v2). Other assignments are not yet passing in the checker.
 - Unit 2's FrozenLake exercise is useful practice but is **not** an assignment tracked by this checker; Taxi-v3 is the tracked model.
 - For assignments with a minimum of -100, the course describes them as upload-only tasks, but model-card metadata still needs to be discoverable.
 - The official course reports that Unit 7 (AI vs AI) is not functional. It may be necessary to pass 9 of the remaining 10 tasks.
