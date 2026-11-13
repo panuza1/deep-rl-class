@@ -57,7 +57,8 @@ def save_checkpoint(path, episode, policy, optimizer):
 
 
 def reinforce(policy, optimizer, n_training_episodes, max_t, gamma, print_every,
-              checkpoint_path, log_path, checkpoint_every, start_episode=0):
+              checkpoint_path, log_path, checkpoint_every, eval_env,
+              best_path, eval_log_path, eval_episodes, start_episode=0):
     # Help us to calculate the score during the training
     scores_deque = deque(maxlen=100)
     scores = []
@@ -140,8 +141,24 @@ def reinforce(policy, optimizer, n_training_episodes, max_t, gamma, print_every,
                 if f.tell() == 0:
                     writer.writerow(["episode", "average_reward_100"])
                 writer.writerow([i_episode, average])
-        if i_episode % checkpoint_every == 0:
+        if i_episode % checkpoint_every == 0 or i_episode == n_training_episodes:
             save_checkpoint(checkpoint_path, i_episode, policy, optimizer)
+            mean, std = evaluate_agent(eval_env, max_t, eval_episodes, policy)
+            score = float(mean - std)
+            print(f"Checkpoint {i_episode}: eval={mean:.2f} +/- {std:.2f}, score={score:.2f}", flush=True)
+            with eval_log_path.open("a", newline="") as f:
+                writer = csv.writer(f)
+                if f.tell() == 0:
+                    writer.writerow(["episode", "mean_reward", "std_reward", "score"])
+                writer.writerow([i_episode, float(mean), float(std), score])
+            old_best = float("-inf")
+            if best_path.exists():
+                old_best = float(torch.load(best_path, map_location="cpu", weights_only=True)["score"])
+            if score > old_best:
+                tmp = best_path.with_suffix(".tmp")
+                torch.save({"episode": i_episode, "score": score, "model": policy.state_dict()}, tmp)
+                tmp.replace(best_path)
+                print(f"New best checkpoint: score={score:.2f}", flush=True)
 
     return scores
 
@@ -200,7 +217,8 @@ def push_to_hub(repo_id,
                 model,
                 hyperparameters,
                 eval_env,
-                video_fps=30
+                video_fps=30,
+                eval_result=None
                 ):
   """
   Evaluate, Generate a video and Upload a model to Hugging Face Hub.
@@ -237,10 +255,9 @@ def push_to_hub(repo_id,
       json.dump(hyperparameters, outfile)
     
     # Step 4: Evaluate the model and build JSON
-    mean_reward, std_reward = evaluate_agent(eval_env, 
-                                            hyperparameters["max_t"],
-                                            hyperparameters["n_evaluation_episodes"], 
-                                            model)
+    mean_reward, std_reward = eval_result if eval_result is not None else evaluate_agent(
+        eval_env, hyperparameters["max_t"], hyperparameters["n_evaluation_episodes"], model
+    )
     # Get datetime
     eval_datetime = datetime.datetime.now()
     eval_form_datetime = eval_datetime.isoformat()
@@ -248,6 +265,7 @@ def push_to_hub(repo_id,
     evaluate_data = {
           "env_id": hyperparameters["env_id"], 
           "mean_reward": float(mean_reward),
+          "std_reward": float(std_reward),
           "n_evaluation_episodes": hyperparameters["n_evaluation_episodes"],
           "eval_datetime": eval_form_datetime,
     }
@@ -327,6 +345,8 @@ def main():
     parser.add_argument("--checkpoint-every", type=int, default=1000)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--upload-only", action="store_true")
+    parser.add_argument("--eval-only", action="store_true")
+    parser.add_argument("--eval-episodes", type=int, default=30)
     args = parser.parse_args()
 
     global env
@@ -352,32 +372,48 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = run_dir / "checkpoint.pt"
     log_path = run_dir / "train_log.csv"
+    best_path = run_dir / "best_model.pt"
+    eval_log_path = run_dir / "eval_log.csv"
+    params["n_evaluation_episodes"] = args.eval_episodes
+    if args.eval_episodes < 2:
+        raise ValueError("--eval-episodes must be at least 2")
 
     start_episode = 0
-    if args.resume or args.upload_only:
+    if args.resume or args.upload_only or args.eval_only:
         if checkpoint_path.exists():
             checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
             model.load_state_dict(checkpoint["model"])
             optimizer.load_state_dict(checkpoint["optimizer"])
             start_episode = int(checkpoint["episode"])
             print(f"Restored checkpoint after episode {start_episode}: {checkpoint_path}")
-        elif args.upload_only:
-            raise FileNotFoundError(f"No saved model at {checkpoint_path}; cannot upload only.")
+        elif args.upload_only or args.eval_only:
+            if not best_path.exists():
+                raise FileNotFoundError(f"No saved model at {checkpoint_path} or {best_path}")
+            print("Latest checkpoint unavailable; loading best saved model.")
 
-    if not args.upload_only and start_episode < episodes:
+    if not args.upload_only and not args.eval_only and start_episode < episodes:
         if args.checkpoint_every < 1:
             raise ValueError("--checkpoint-every must be at least 1")
         print("Training", env_id, "on", device)
         reinforce(model, optimizer, episodes, max_t, gamma, every,
-                  checkpoint_path, log_path, args.checkpoint_every, start_episode)
-        save_checkpoint(checkpoint_path, episodes, model, optimizer)
+                  checkpoint_path, log_path, args.checkpoint_every,
+                  eval_env, best_path, eval_log_path, args.eval_episodes, start_episode)
     else:
         print("Using saved model; no training needed.")
 
-    if args.upload_only:
+    if best_path.exists():
+        best = torch.load(best_path, map_location=device, weights_only=True)
+        model.load_state_dict(best["model"])
+        print(f"Selected best saved model: episode={best['episode']}, checkpoint score={best['score']:.2f}")
+        params["n_training_episodes"] = int(best["episode"])
+    elif args.eval_only or args.upload_only:
         params["n_training_episodes"] = start_episode
-    print("Evaluation:", evaluate_agent(eval_env, max_t, 10, model))
-    push_to_hub(repo_id, model, params, eval_env)
+
+    results = evaluate_agent(eval_env, max_t, args.eval_episodes, model)
+    score = float(results[0] - results[1])
+    print(f"Evaluation: mean={results[0]:.2f}, std={results[1]:.2f}, score={score:.2f}")
+    if not args.eval_only:
+        push_to_hub(repo_id, model, params, eval_env, eval_result=results)
     env.close()
     eval_env.close()
 
