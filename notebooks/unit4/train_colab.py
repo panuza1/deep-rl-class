@@ -1,5 +1,6 @@
 """Unit 4 REINFORCE training and Hugging Face submission (Python 3.10)."""
 import argparse
+import csv
 import datetime
 import json
 import os
@@ -44,12 +45,24 @@ class Policy(nn.Module):
         return action.item(), m.log_prob(action)
 
 
-def reinforce(policy, optimizer, n_training_episodes, max_t, gamma, print_every):
+def save_checkpoint(path, episode, policy, optimizer):
+    # Atomic replacement protects the previous checkpoint if Colab disconnects.
+    tmp = path.with_suffix(".tmp")
+    torch.save({
+        "episode": episode,
+        "model": policy.state_dict(),
+        "optimizer": optimizer.state_dict(),
+    }, tmp)
+    tmp.replace(path)
+
+
+def reinforce(policy, optimizer, n_training_episodes, max_t, gamma, print_every,
+              checkpoint_path, log_path, checkpoint_every, start_episode=0):
     # Help us to calculate the score during the training
     scores_deque = deque(maxlen=100)
     scores = []
     # Line 3 of pseudocode
-    for i_episode in range(1, n_training_episodes+1):
+    for i_episode in range(start_episode + 1, n_training_episodes + 1):
         saved_log_probs = []
         rewards = []
         state = env.reset()
@@ -120,8 +133,16 @@ def reinforce(policy, optimizer, n_training_episodes, max_t, gamma, print_every)
         optimizer.step()
         
         if i_episode % print_every == 0:
-            print('Episode {}\tAverage Score: {:.2f}'.format(i_episode, np.mean(scores_deque)))
-        
+            average = float(np.mean(scores_deque))
+            print(f"Episode {i_episode}\tAverage Score: {average:.2f}", flush=True)
+            with log_path.open("a", newline="") as f:
+                writer = csv.writer(f)
+                if f.tell() == 0:
+                    writer.writerow(["episode", "average_reward_100"])
+                writer.writerow([i_episode, average])
+        if i_episode % checkpoint_every == 0:
+            save_checkpoint(checkpoint_path, i_episode, policy, optimizer)
+
     return scores
 
 def evaluate_agent(env, max_steps, n_eval_episodes, policy):
@@ -152,7 +173,7 @@ def evaluate_agent(env, max_steps, n_eval_episodes, policy):
 
   return mean_reward, std_reward
 
-def record_video(env, policy, out_directory, fps=30):
+def record_video(env, policy, out_directory, fps=30, max_steps=10000):
   """
   Generate a replay video of the agent
   :param env
@@ -165,13 +186,15 @@ def record_video(env, policy, out_directory, fps=30):
   state = env.reset()
   img = env.render(mode='rgb_array')
   images.append(img)
-  while not done:
+  for _ in range(max_steps):
     # Take the action (index) that have the maximum expected future reward given that state
     action, _ = policy.act(state)
     state, reward, done, info = env.step(action) # We directly put next_state = state for recording logic
     img = env.render(mode='rgb_array')
     images.append(img)
-  imageio.mimsave(out_directory, [np.array(img) for i, img in enumerate(images)], fps=fps)
+    if done:
+      break
+  imageio.mimsave(out_directory, images, fps=fps)
 
 def push_to_hub(repo_id, 
                 model,
@@ -224,7 +247,7 @@ def push_to_hub(repo_id,
 
     evaluate_data = {
           "env_id": hyperparameters["env_id"], 
-          "mean_reward": mean_reward,
+          "mean_reward": float(mean_reward),
           "n_evaluation_episodes": hyperparameters["n_evaluation_episodes"],
           "eval_datetime": eval_form_datetime,
     }
@@ -262,7 +285,7 @@ def push_to_hub(repo_id,
 
     model_card = f"""
   # **Reinforce** Agent playing **{env_name}**
-  This is a trained model of a **Reinforce** agent playing **{env_id}** .
+  This is a trained model of a **Reinforce** agent playing **{env_name}** .
   To learn to use this model and train yours check Unit 4 of the Deep Reinforcement Learning Course: https://huggingface.co/deep-rl-course/unit4/introduction
   """
 
@@ -282,7 +305,10 @@ def push_to_hub(repo_id,
 
     # Step 6: Record a video
     video_path =  local_directory / "replay.mp4"
-    record_video(eval_env, model, video_path, video_fps)
+    try:
+        record_video(eval_env, model, video_path, video_fps, hyperparameters["max_t"])
+    except Exception as exc:
+        print(f"Replay video skipped: {exc}. Model upload will continue.")
 
     # Step 7. Push everything to the Hub
     api.upload_folder(
@@ -297,6 +323,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--env-id", choices=["CartPole-v1", "Pixelcopter-PLE-v0"], required=True)
     parser.add_argument("--episodes", type=int)
+    parser.add_argument("--output-dir", default="/content/unit4_runs")
+    parser.add_argument("--checkpoint-every", type=int, default=1000)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--upload-only", action="store_true")
     args = parser.parse_args()
 
     global env
@@ -318,8 +348,34 @@ def main():
                   state_space=s_size, action_space=a_size)
     model = Policy(s_size, a_size, h_size).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    print("Training", env_id, "on", device)
-    reinforce(model, optimizer, episodes, max_t, gamma, every)
+    run_dir = Path(args.output_dir) / env_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = run_dir / "checkpoint.pt"
+    log_path = run_dir / "train_log.csv"
+
+    start_episode = 0
+    if args.resume or args.upload_only:
+        if checkpoint_path.exists():
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+            model.load_state_dict(checkpoint["model"])
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            start_episode = int(checkpoint["episode"])
+            print(f"Restored checkpoint after episode {start_episode}: {checkpoint_path}")
+        elif args.upload_only:
+            raise FileNotFoundError(f"No saved model at {checkpoint_path}; cannot upload only.")
+
+    if not args.upload_only and start_episode < episodes:
+        if args.checkpoint_every < 1:
+            raise ValueError("--checkpoint-every must be at least 1")
+        print("Training", env_id, "on", device)
+        reinforce(model, optimizer, episodes, max_t, gamma, every,
+                  checkpoint_path, log_path, args.checkpoint_every, start_episode)
+        save_checkpoint(checkpoint_path, episodes, model, optimizer)
+    else:
+        print("Using saved model; no training needed.")
+
+    if args.upload_only:
+        params["n_training_episodes"] = start_episode
     print("Evaluation:", evaluate_agent(eval_env, max_t, 10, model))
     push_to_hub(repo_id, model, params, eval_env)
     env.close()
