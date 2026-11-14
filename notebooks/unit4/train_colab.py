@@ -9,7 +9,6 @@ from collections import deque
 from pathlib import Path
 
 import gym
-import gym_pygame
 import imageio
 import numpy as np
 import torch
@@ -52,13 +51,15 @@ def save_checkpoint(path, episode, policy, optimizer):
         "episode": episode,
         "model": policy.state_dict(),
         "optimizer": optimizer.state_dict(),
+        "torch_rng_state": torch.get_rng_state(),
     }, tmp)
     tmp.replace(path)
 
 
 def reinforce(policy, optimizer, n_training_episodes, max_t, gamma, print_every,
               checkpoint_path, log_path, checkpoint_every, eval_env,
-              best_path, eval_log_path, eval_episodes, start_episode=0):
+              best_path, eval_log_path, eval_episodes, start_episode=0,
+              train_seed=None, eval_seed=None):
     # Help us to calculate the score during the training
     scores_deque = deque(maxlen=100)
     scores = []
@@ -66,7 +67,7 @@ def reinforce(policy, optimizer, n_training_episodes, max_t, gamma, print_every,
     for i_episode in range(start_episode + 1, n_training_episodes + 1):
         saved_log_probs = []
         rewards = []
-        state = env.reset()
+        state = env.reset(seed=train_seed + i_episode) if train_seed is not None else env.reset()
         # Line 4 of pseudocode
         for t in range(max_t):
             action, log_prob = policy.act(state)
@@ -143,7 +144,7 @@ def reinforce(policy, optimizer, n_training_episodes, max_t, gamma, print_every,
                 writer.writerow([i_episode, average])
         if i_episode % checkpoint_every == 0 or i_episode == n_training_episodes:
             save_checkpoint(checkpoint_path, i_episode, policy, optimizer)
-            mean, std = evaluate_agent(eval_env, max_t, eval_episodes, policy)
+            mean, std = evaluate_agent(eval_env, max_t, eval_episodes, policy, seed=eval_seed)
             score = float(mean - std)
             print(f"Checkpoint {i_episode}: eval={mean:.2f} +/- {std:.2f}, score={score:.2f}", flush=True)
             with eval_log_path.open("a", newline="") as f:
@@ -162,33 +163,28 @@ def reinforce(policy, optimizer, n_training_episodes, max_t, gamma, print_every,
 
     return scores
 
-def evaluate_agent(env, max_steps, n_eval_episodes, policy):
-  """
-  Evaluate the agent for ``n_eval_episodes`` episodes and returns average reward and std of reward.
-  :param env: The evaluation environment
-  :param n_eval_episodes: Number of episode to evaluate the agent
-  :param policy: The Reinforce agent
-  """
-  episode_rewards = []
-  for episode in range(n_eval_episodes):
-    state = env.reset()
-    step = 0
-    done = False
-    total_rewards_ep = 0
-    
-    for step in range(max_steps):
-      action, _ = policy.act(state)
-      new_state, reward, done, info = env.step(action)
-      total_rewards_ep += reward
-        
-      if done:
-        break
-      state = new_state
-    episode_rewards.append(total_rewards_ep)
-  mean_reward = np.mean(episode_rewards)
-  std_reward = np.std(episode_rewards)
+def evaluate_agent(env, max_steps, n_eval_episodes, policy, seed=None):
+    """Evaluate sampled actions, optionally on the same reproducible rollouts."""
+    saved_rng = torch.get_rng_state() if seed is not None else None
+    if seed is not None:
+        torch.manual_seed(seed)
+    episode_rewards = []
+    try:
+        for episode in range(n_eval_episodes):
+            state = env.reset(seed=seed + episode) if seed is not None else env.reset()
+            total_reward = 0
+            for _ in range(max_steps):
+                action, _ = policy.act(state)
+                state, reward, done, _ = env.step(action)
+                total_reward += reward
+                if done:
+                    break
+            episode_rewards.append(total_reward)
+    finally:
+        if saved_rng is not None:
+            torch.set_rng_state(saved_rng)
+    return float(np.mean(episode_rewards)), float(np.std(episode_rewards))
 
-  return mean_reward, std_reward
 
 def record_video(env, policy, out_directory, fps=30, max_steps=10000):
   """
@@ -347,16 +343,26 @@ def main():
     parser.add_argument("--upload-only", action="store_true")
     parser.add_argument("--eval-only", action="store_true")
     parser.add_argument("--eval-episodes", type=int, default=30)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--cartpole-solution", action="store_true")
+    parser.add_argument("--min-score", type=float, default=None)
     args = parser.parse_args()
 
     global env
     env_id = args.env_id
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if env_id == "Pixelcopter-PLE-v0":
+        import gym_pygame  # Registers Pixelcopter with Gym
     env = gym.make(env_id)
     eval_env = gym.make(env_id)
     s_size = env.observation_space.shape[0]
     a_size = env.action_space.n
     if env_id == "CartPole-v1":
-        h_size, lr, gamma, episodes, max_t, every = 16, 1e-2, 1.0, 1000, 1000, 100
+        h_size, lr, gamma, episodes, max_t, every = (
+            (128, 1e-2, 0.99, 3000, 500, 100)
+            if args.cartpole_solution else (16, 1e-2, 1.0, 1000, 1000, 100)
+        )
         repo_id = "panuza007/Reinforce-CartPole-v1"
     else:
         h_size, lr, gamma, episodes, max_t, every = 64, 1e-4, 0.99, 50000, 10000, 1000
@@ -374,7 +380,9 @@ def main():
     log_path = run_dir / "train_log.csv"
     best_path = run_dir / "best_model.pt"
     eval_log_path = run_dir / "eval_log.csv"
-    params["n_evaluation_episodes"] = args.eval_episodes
+    params["n_evaluation_episodes"] = (
+        max(100, args.eval_episodes) if args.cartpole_solution else args.eval_episodes
+    )
     if args.eval_episodes < 2:
         raise ValueError("--eval-episodes must be at least 2")
 
@@ -385,6 +393,8 @@ def main():
             model.load_state_dict(checkpoint["model"])
             optimizer.load_state_dict(checkpoint["optimizer"])
             start_episode = int(checkpoint["episode"])
+            if "torch_rng_state" in checkpoint:
+                torch.set_rng_state(checkpoint["torch_rng_state"])
             print(f"Restored checkpoint after episode {start_episode}: {checkpoint_path}")
         elif args.upload_only or args.eval_only:
             if not best_path.exists():
@@ -397,7 +407,9 @@ def main():
         print("Training", env_id, "on", device)
         reinforce(model, optimizer, episodes, max_t, gamma, every,
                   checkpoint_path, log_path, args.checkpoint_every,
-                  eval_env, best_path, eval_log_path, args.eval_episodes, start_episode)
+                  eval_env, best_path, eval_log_path, args.eval_episodes, start_episode,
+                  train_seed=args.seed if env_id == "CartPole-v1" else None,
+                  eval_seed=args.seed + 10_000 if env_id == "CartPole-v1" else None)
     else:
         print("Using saved model; no training needed.")
 
@@ -409,11 +421,17 @@ def main():
     elif args.eval_only or args.upload_only:
         params["n_training_episodes"] = start_episode
 
-    results = evaluate_agent(eval_env, max_t, args.eval_episodes, model)
+    results = evaluate_agent(
+        eval_env, max_t, params["n_evaluation_episodes"], model,
+        seed=args.seed + 20_000 if env_id == "CartPole-v1" else None,
+    )
     score = float(results[0] - results[1])
     print(f"Evaluation: mean={results[0]:.2f}, std={results[1]:.2f}, score={score:.2f}")
     if not args.eval_only:
-        push_to_hub(repo_id, model, params, eval_env, eval_result=results)
+        if args.min_score is not None and score < args.min_score:
+            print(f"Score {score:.2f} is below {args.min_score:.2f}; Hub upload skipped.")
+        else:
+            push_to_hub(repo_id, model, params, eval_env, eval_result=results)
     env.close()
     eval_env.close()
 
