@@ -1,8 +1,4 @@
-gymnasium==0.29.1
-stable-baselines3==2.3.2
-numpy<2
+stable-baselines3==2.0.0a4
 huggingface_sb3
-panda-gym==3.0.7
+panda-gym
 huggingface_hub
-pyvirtualdisplay
-ipykernel
